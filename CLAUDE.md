@@ -12,13 +12,25 @@ It is Project 2 of two.
 | Project | Repo | Scope |
 |---|---|---|
 | 1. MCA automation - Form Filler | `Form-Filler` | Tally -> Schedule III financials -> staff review -> fill MCA forms (AOC-4, MGT-7/7A, ADT-1). Owned by the other Claude account. Do not change it from here. |
-| 2. Practice Agentic OS (this repo) | `CA-Filler-2` | Home, clients, Professional Services (Financials, ROC, GST, Income tax, TDS, Other levies), AI (Agents at work, Queries), Office (Inbox, Billing, Settings). |
+| 2. Practice Agentic OS (this repo) | `CA-Filler-2` | Home, proposals, clients, Professional Services (Financials, ROC, GST, Income tax, TDS, Other levies), AI (Agents at work, Queries), Office (Inbox, Billing, Settings). |
 
 Interface between the two: the OS hands Form Filler an approved Schedule III workbook plus answers; Form Filler returns status, SRN and the filed documents. Reuse Form Filler's Tally reader and Schedule III builder; do not fork them.
+
+## Proposal Maker link (decided by the owner, 16 Nov 2026)
+
+Every client starts as a proposal. The Proposal Maker is a separate, existing app (repo `nkl-proposal-stream`, React on Lovable Cloud with managed Postgres, partners only). It is linked, not rebuilt. Do not change that repo from here and do not copy its screens into this one.
+
+- The "Proposals" menu item lists proposals with their status and opens the selected one in Proposal Maker.
+- The OS reads proposals one way, over HTTPS from the office desktop. It never writes to the Proposal Maker database. The connection details are a secret kept in Settings, never in this repo.
+- When a proposal reaches Executed, the OS prepares a client set-up for staff to confirm once: client master (group, entities, constitution, PAN, GSTIN, contact person), the client folder with the signed engagement letter, the engaged services switched on under Professional Services, tasks and due dates, fee drafts for Billing, and the renewal reminder.
+- Fees, internal rates and meeting notes are visible to partners only, in the OS as in Proposal Maker.
+- The service list in the OS must use the same service names as the Proposal Maker service library, so an executed proposal maps to service lines without a lookup by hand.
+- Before building: write the read contract (which tables and fields, how Executed is detected) in `docs/proposal-link.md` and list any gap in `STATUS.md`.
 
 ## Order of work
 
 1. Skeleton: app shell with the menu below, client list, users, one folder per client (`Group name - Client name`).
+   1a. Proposals link, as described above, so the client list fills from executed proposals.
 2. Financials: "Get data" on one click produces the Schedule III pack for 3 clients (via the shared Schedule III engine).
 3. GST annual returns: GSTR-9 and GSTR-9C, output as the official JSON / offline-utility file for upload. No screen filling of the GST portal.
 4. TDS: monthly computation workflow, then quarterly return (FVU file).
@@ -29,7 +41,7 @@ Do not start a later item before the earlier one is accepted in `STATUS.md`.
 
 ## Menu (fixed)
 
-- Home, Clients
+- Home, Proposals, Clients
 - Professional Services: Financials, ROC, GST, Income tax, TDS, Other levies
 - AI: Agents at work, Queries
 - Office: Inbox, Billing, Settings
