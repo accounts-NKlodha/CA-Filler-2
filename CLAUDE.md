@@ -56,6 +56,7 @@ Do not start a later item before the earlier one is accepted in `STATUS.md`.
 - Every figure must be traceable: keep the chain source (Tally ledger / file) -> mapping -> working -> output field, with who and when, in the client folder. Records are kept 8 years.
 - A query goes first to the local model, then to a staff reviewer the same working day, and to a partner only for doubts and critical items.
 - Show a low-fidelity wireframe and get the owner's sign-off before building any new screen.
+- The high-fidelity "Lodha OS design" (9 screens) was signed off by the owner on 18 Nov 2026 "for now". Build those screens to it. Screens not in it (Income tax, TDS, Other levies) still need a wireframe first.
 
 ## Engineering
 
