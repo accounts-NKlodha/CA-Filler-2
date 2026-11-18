@@ -314,6 +314,7 @@ def build(client, root, settings, user=AGENT, say=None, engine=None):
         st["unapproved"] = [r["ledger"] for r in rows if not r.get("approved")]
         st["has_py"] = py.exists()
         st["state"] = "done"
+        _write_json(review_path(folder, fy), {"cleared": {}, "verified": None})
         clients.trail(root, client, "financials", "Schedule III workbook built: %s" % final.name, user, file=final.name,
                       ledgers=len(rows), source="financials/%s/tb_cy.csv" % fy, mapping="financials/config.json")
     except StaffNeeded:
@@ -359,9 +360,29 @@ def failed_checks(checks):
     return bad
 
 
+def _slug(text):
+    return "-".join("".join(ch.lower() if ch.isalnum() else " " for ch in text).split())[:60]
+
+
+def review_path(folder, fy):
+    return fin_dir(folder) / fy / "review.json"
+
+
+def load_review(folder, fy):
+    p = review_path(folder, fy)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except ValueError:
+            pass
+    return {"cleared": {}, "verified": None}
+
+
 def status(client, root, fy):
-    """{"tb_cy": {...} | None, "tb_py": ..., "build": last_build.json | None, "workbook": Path | None, "points": [...]}"""
-    out = {"tb_cy": None, "tb_py": None, "build": None, "workbook": None, "points": []}
+    """What the screens show for one client and year.
+    points: [{"id", "kind", "text", "cleared": {"by", "at", "note"} | None}]. A mapping point is never cleared by
+    hand: it goes when a reviewer approves the heads and the workbook is rebuilt."""
+    out = {"tb_cy": None, "tb_py": None, "build": None, "workbook": None, "points": [], "open": 0, "verified": None, "stale": False}
     if not root:
         return out
     folder = clients.folder_path(root, client)
@@ -386,15 +407,99 @@ def status(client, root, fy):
     if wb.exists():
         out["workbook"] = wb
     b = out["build"]
+    rv = load_review(folder, fy)
     if b and b.get("state") == "done":
-        for c in failed_checks(b.get("checks")):
-            out["points"].append(("check", c))
+        pts = [("check:" + _slug(c), "check", c) for c in failed_checks(b.get("checks"))]
         n = len(b.get("unapproved") or [])
         if n:
-            out["points"].append(("mapping", "%d ledgers mapped by the agent: a reviewer confirms the heads" % n))
+            pts.append(("mapping", "mapping", "%d ledgers mapped by the agent: a reviewer confirms the heads" % n))
         if not b.get("has_py"):
-            out["points"].append(("data", "Last year's trial balance is missing: comparatives are blank"))
+            pts.append(("no-last-year", "data", "Last year's trial balance is missing: comparatives are blank"))
+        for pid, kind, text in pts:
+            out["points"].append({"id": pid, "kind": kind, "text": text, "cleared": None if kind == "mapping" else rv["cleared"].get(pid)})
+        out["stale"] = bool(rv.get("stale"))
+        out["verified"] = rv.get("verified")
+    out["open"] = sum(1 for p in out["points"] if not p["cleared"])
     return out
+
+
+# ---------------------------------------------------------------- the reviewer's part
+
+def mapping_rows(client, root, fy, eng):
+    """Every ledger with its Tally default and proposed Schedule III head (the engine's analysis)."""
+    folder = clients.folder_path(root, client)
+    d = fin_dir(folder) / fy
+    cy, py = d / "tb_cy.csv", d / "tb_py.csv"
+    if not cy.exists():
+        return []
+    return eng.approval.analyse(eng.tally.read_tb(str(cy)), eng.tally.read_tb(str(py)) if py.exists() else [], load_cfg(folder, client, fy))
+
+
+def approve_heads(client, root, fy, decisions, user, eng):
+    """decisions: {ledger: head code}. Records the approver on each ledger in config.json and in the trail.
+    The workbook is then out of date until it is rebuilt, and any earlier tick is withdrawn."""
+    codes = {o["code"]: o["label"] for o in eng.approval.head_options()}
+    decisions = {l: c for l, c in decisions.items() if c in codes}
+    if not decisions:
+        return 0
+    folder = clients.folder_path(root, client)
+    cfg = load_cfg(folder, client, fy)
+    rows = mapping_rows(client, root, fy, eng)
+    known = {r["ledger"]: r for r in rows}
+    decisions = {l: c for l, c in decisions.items() if l in known}
+    eng.approval.apply_decisions(cfg, rows, decisions, user, fy)
+    save_cfg(folder, cfg)
+    for led, code in decisions.items():
+        was = (known[led].get("proposed") or {}).get("code", "")
+        clients.trail(root, client, "financials", "Ledger '%s' mapped to %s%s" % (led, codes[code], "" if was == code else " (reviewer changed the proposed head)"),
+                      user, ledger=led, code=code, proposed=was, override=was != code)
+    rv = load_review(folder, fy)
+    rv.update(verified=None, stale=True)
+    _write_json(review_path(folder, fy), rv)
+    return len(decisions)
+
+
+def clear_point(client, root, fy, pid, user, note):
+    """A reviewer accepts one review point, with the reason. Mapping points cannot be cleared this way."""
+    note = " ".join((note or "").split())
+    st = status(client, root, fy)
+    pt = next((p for p in st["points"] if p["id"] == pid), None)
+    if not pt:
+        raise ValueError("This review point is no longer open")
+    if pt["kind"] == "mapping":
+        raise ValueError("Confirm the ledger heads to clear this point")
+    if len(note) < 5:
+        raise ValueError("Write why this point is acceptable: the reason is kept in the audit trail")
+    folder = clients.folder_path(root, client)
+    rv = load_review(folder, fy)
+    rv["cleared"][pid] = {"by": user, "at": _now(), "note": note}
+    _write_json(review_path(folder, fy), rv)
+    clients.trail(root, client, "financials", "Review point cleared: %s. Reason: %s" % (pt["text"], note), user, point=pid)
+
+
+def verify(client, root, fy, user):
+    """The reviewer's tick: financials verified. Only with a current workbook and no open point."""
+    st = status(client, root, fy)
+    if not st["workbook"]:
+        raise ValueError("There is no Schedule III workbook yet")
+    if st["stale"]:
+        raise ValueError("Heads were changed after the workbook was built: rebuild it first")
+    if st["open"]:
+        raise ValueError("%d review points are still open" % st["open"])
+    folder = clients.folder_path(root, client)
+    rv = load_review(folder, fy)
+    rv["verified"] = {"by": user, "at": _now(), "workbook": st["workbook"].name}
+    _write_json(review_path(folder, fy), rv)
+    clients.trail(root, client, "financials", "Financials verified: %s" % st["workbook"].name, user, file=st["workbook"].name)
+
+
+def unverify(client, root, fy, user):
+    folder = clients.folder_path(root, client)
+    rv = load_review(folder, fy)
+    if rv.get("verified"):
+        rv["verified"] = None
+        _write_json(review_path(folder, fy), rv)
+        clients.trail(root, client, "financials", "Verified tick withdrawn", user)
 
 
 # ---------------------------------------------------------------- job board: one client at a time, Tally is single
@@ -403,8 +508,8 @@ class Jobs:
     """Runs Get data for the chosen clients one after another on a worker thread. The latest job per client is
     kept in the store so the screen survives a refresh; a job left running by a restart is marked failed."""
 
-    def __init__(self, st, runner=get_data):
-        self.st, self.runner = st, runner
+    def __init__(self, st, runner=get_data, builder=build):
+        self.st, self.runner, self.builder = st, runner, builder
         self.lock = threading.RLock()
         self.queue = []
         self.thread = None
@@ -429,15 +534,16 @@ class Jobs:
     def busy(self):
         return any(j["state"] in ("queued", "running") for j in self.all().values())
 
-    def start(self, rows, root, settings, user, picks=None, wait=False):
-        """rows: client dicts. picks: {client id: {"tb_cy"|"tb_py": company}}."""
+    def start(self, rows, root, settings, user, picks=None, wait=False, rebuild=False):
+        """rows: client dicts. picks: {client id: {"tb_cy"|"tb_py": company}}.
+        rebuild: build again from the stored trial balances without reading Tally."""
         with self.lock:
             for c in rows:
                 j = self.get(c["id"])
                 if j and j["state"] in ("queued", "running"):
                     continue
                 self._set(c["id"], state="queued", note="Waiting for its turn", pick=None, by=user, at=_now(), fy=settings["financial_year"])
-                self.queue.append((c, root, dict(settings), user, (picks or {}).get(c["id"])))
+                self.queue.append((c, root, dict(settings), user, (picks or {}).get(c["id"]), rebuild))
             if not self.thread or not self.thread.is_alive():
                 self.thread = threading.Thread(target=self._work, daemon=True)
                 self.thread.start()
@@ -449,15 +555,19 @@ class Jobs:
             with self.lock:
                 if not self.queue:
                     return
-                c, root, settings, user, picks = self.queue.pop(0)
+                c, root, settings, user, picks, rebuild = self.queue.pop(0)
             cid = c["id"]
             self._set(cid, state="running", note="Starting")
             try:
-                st = self.runner(c, root, settings, user=AGENT, say=lambda m: self._set(cid, note=m), picks=picks)
-                pts = len(status(c, root, settings["financial_year"])["points"])
+                say = lambda m: self._set(cid, note=m)
+                if rebuild:
+                    st = self.builder(c, root, settings, user=AGENT, say=say)
+                else:
+                    st = self.runner(c, root, settings, user=AGENT, say=say, picks=picks)
+                pts = status(c, root, settings["financial_year"])["open"]
                 self._set(cid, state="review" if pts else "done", done=_now(),
                           note="%d review points for the reviewer" % pts if pts else "Schedule III ready, no open points")
-                clients.trail(root, c, "financials", "Get data finished: %s (started by %s)" % (st.get("out", ""), user), AGENT)
+                clients.trail(root, c, "financials", "%s finished: %s (started by %s)" % ("Rebuild" if rebuild else "Get data", st.get("out", ""), user), AGENT)
             except StaffNeeded as e:
                 self._set(cid, state="staff", note=str(e), pick=e.pick, done=_now())
             except Exception as e:  # noqa: BLE001

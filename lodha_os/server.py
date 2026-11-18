@@ -33,6 +33,7 @@ class App:
         self.clients = clients.Clients(self.st)
         self.sessions = auth.Sessions()
         self.fin_jobs = financials.Jobs(self.st)
+        self.fin_engine = None  # tests put a stand-in here; otherwise loaded from the Form Filler folder
 
     # ------------------------------------------------------------------ plumbing
     def handle(self, method, path, query=None, form=None, cookie=""):
@@ -303,6 +304,25 @@ class App:
         c = self.clients.get(rest[0])
         if not c or c not in self.fin_clients():
             return 404, {}, self.page(ctx, "financials", "Client not found", '<p><a href="/financials">Back to Financials</a></p>')
+        root, fy, cid = self.root(), ctx["fy"], c["id"]
+        if rest[1:] == ["mapping"]:
+            return self.fin_mapping(method, c, form, ctx)
+        if method == "POST" and rest[1:] and rest[1] in ("clear", "verify", "unverify", "rebuild"):
+            if not auth.can(user, "review"):
+                return 403, {}, self.page(ctx, "financials", "Not allowed", "<p>Only a reviewer or a partner can do this.</p>")
+            err = ""
+            try:
+                if rest[1] == "clear":
+                    financials.clear_point(c, root, fy, form.get("pid", ""), user["name"], form.get("note", ""))
+                elif rest[1] == "verify":
+                    financials.verify(c, root, fy, user["name"])
+                elif rest[1] == "unverify":
+                    financials.unverify(c, root, fy, user["name"])
+                elif not self.fin_ready():
+                    self.fin_jobs.start([c], root, self.s, user["name"], rebuild=True)
+            except ValueError as e:
+                err = str(e)
+            return ok(self.fin_view(c, ctx, err)) if err else redirect("/financials/" + cid)
         if rest[1:] == ["workbook"]:
             wb = financials.status(c, self.root(), ctx["fy"])["workbook"]
             if not wb:
@@ -333,12 +353,14 @@ class App:
             if job and job.get("fy", fy) != fy:
                 job = None
             tb = lambda t: ('%s<br><span class="cap">%s</span>' % (esc(t["company"]), esc(ui.day(t["at"], True)))) if t else '<span class="mut">Not read</span>'
-            if job:
+            if job and (job["state"] not in ("review", "done") or not st["workbook"]):
                 lab, kind = self.JOB[job["state"]]
                 where = "%s <span class=\"cap\">%s</span>" % (badge(lab, kind), esc(job.get("note", "")))
+            elif st["verified"]:
+                where = '%s <span class="cap">%s, %s</span>' % (badge("Verified", "ok"), esc(st["verified"]["by"]), esc(ui.day(st["verified"]["at"])))
             elif st["workbook"]:
-                n = len(st["points"])
-                where = badge("%d review points" % n, "wa") if n else badge("Ready", "ok")
+                n = st["open"]
+                where = badge("%d review points" % n, "wa") if n else badge("Ready for the tick", "wa")
             else:
                 where = '<span class="mut">Not started</span>'
             wb = '<a href="/financials/%s">Open</a>' % c["id"] if st["workbook"] else '<span class="mut">Not built</span>'
@@ -354,16 +376,66 @@ class App:
         act = '<button class="btn p" type="submit" form="gd"%s>Get data</button>' % (" disabled" if why else "")
         return self.page(ctx, "financials", "Financials", "".join(out) + body, sub="Professional Services", actions=act)
 
-    def fin_view(self, c, ctx):
+    def fin_eng(self):
+        return self.fin_engine or financials.load_engine(self.s["form_filler_dir"])
+
+    def fin_mapping(self, method, c, form, ctx):
+        root, fy, user = self.root(), ctx["fy"], ctx["user"]
+        can = auth.can(user, "review")
+        try:
+            eng = self.fin_eng()
+        except financials.EngineMissing as e:
+            return ok(self.page(ctx, "financials", "Ledger heads", '<div class="note">%s</div>' % esc(str(e))))
+        rows = financials.mapping_rows(c, root, fy, eng) if root else []
+        pend = [r for r in rows if not r["approved"]]
+        if method == "POST":
+            if not can:
+                return 403, {}, self.page(ctx, "financials", "Not allowed", "<p>Only a reviewer or a partner can confirm ledger heads.</p>")
+            dec = {}
+            for i in range(int(form.get("n") or 0)):
+                led, code = form.get("led_%d" % i), form.get("head_%d" % i)
+                if led and code:
+                    dec[led] = code
+            if financials.approve_heads(c, root, fy, dec, user["name"], eng) and not self.fin_ready():
+                self.fin_jobs.start([c], root, self.s, user["name"], rebuild=True)
+            return redirect("/financials/" + c["id"])
+        sub = '<a href="/financials">Financials</a> · <a href="/financials/%s">%s</a> · FY %s' % (c["id"], esc(c["name"]), esc(fy))
+        if not pend:
+            body = '<div class="card"><div class="empty">%s</div></div>' % (
+                "Every ledger's Schedule III head is approved." if rows else "There is no trial balance yet. Run Get data first.")
+            return ok(self.page(ctx, "financials", "Ledger heads", body, sub=sub))
+        opts = eng.approval.head_options()
+        cols = "grid-template-columns:1.4fr 1fr 110px 110px 1.8fr"
+        amt = lambda x: esc("{:,.2f}".format(abs(x)) + (" Dr" if x < 0 else " Cr" if x > 0 else ""))
+        body = ('<form method="post" id="mp">%s<input type="hidden" name="n" value="%d"><div class="card"><div class="ch"><h2>%d ledgers to confirm</h2>'
+                '<span class="cap">Balances as read from Tally. The head shown is the agent\'s proposal: change it where it is wrong.</span></div>'
+                '<div class="tr th" style="%s"><span>Ledger</span><span>Tally group</span><span class="num">This year</span><span class="num">Last year</span><span>Schedule III head</span></div>'
+                % (hidden(ctx["csrf"]), len(pend), len(pend), cols))
+        for i, r in enumerate(pend):
+            cur = (r.get("proposed") or {}).get("code", "")
+            sel = '<option value="">Pick a head</option>' + "".join('<option value="%s"%s>%s</option>' % (esc(o["code"]), " selected" if o["code"] == cur else "", esc(o["label"])) for o in opts)
+            why = " · ".join(x for x in (r.get("reason"), r.get("warn")) if x)
+            body += ('<div class="tr" style="%s"><span><span style="font-weight:500">%s</span>%s</span><span class="mut">%s</span><span class="num">%s</span><span class="num">%s</span>'
+                     '<span><input type="hidden" name="led_%d" value="%s"><select class="sel" name="head_%d" aria-label="Head for %s"%s>%s</select></span></div>'
+                     % (cols, esc(r["ledger"]), '<br><span class="cap">%s</span>' % esc(why) if why else "", esc(r["group"]), amt(r["cy"]), amt(r["py"]),
+                        i, esc(r["ledger"]), i, esc(r["ledger"]), "" if can else " disabled", sel))
+        body += '</div></form><p class="cap" style="margin:0">Confirming records your name against each ledger and rebuilds the workbook. The heads are remembered for next year.</p>'
+        act = '<button class="btn p" type="submit" form="mp">Confirm heads and rebuild</button>' if can else ""
+        return ok(self.page(ctx, "financials", "Ledger heads", body, sub=sub, actions=act))
+
+    def fin_view(self, c, ctx, err=""):
         root, fy = self.root(), ctx["fy"]
         st = financials.status(c, root, fy)
         job = self.fin_jobs.get(c["id"])
         if job and job.get("fy", fy) != fy:
             job = None
         why = self.fin_ready()
+        can = auth.can(ctx["user"], "review")
         out = []
         if why:
             out.append('<div class="note">%s</div>' % esc(why))
+        if err:
+            out.append('<div class="note" role="alert">%s</div>' % esc(err))
         if job and job["state"] in ("queued", "running"):
             out.append('<div class="note" role="status">%s %s</div><script>setTimeout(function(){location.reload()},4000)</script>'
                        % (badge("Agent working", "in"), esc(job.get("note", ""))))
@@ -389,12 +461,31 @@ class App:
                    if wb else '<span class="mut">Not built yet</span>') +
                 kv("Kept in", '<span class="mono">%s</span>' % esc(str(clients.folder_path(root, c))) if root else '<span class="mut">Not set</span>'))
         kinds = {"check": "Check", "mapping": "Mapping", "data": "Data"}
-        pts = "".join('<div class="tr" style="grid-template-columns:96px 1fr"><span>%s</span><span>%s</span></div>' % (badge(kinds[k], "wa"), esc(t)) for k, t in st["points"])
+        post = lambda action, inner: '<form method="post" action="/financials/%s/%s" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">%s%s</form>' % (c["id"], action, hidden(ctx["csrf"]), inner)
+        pts = ""
+        for p in st["points"]:
+            if p["cleared"]:
+                right = '%s <span class="cap">%s, %s: %s</span>' % (badge("Cleared", "ok"), esc(p["cleared"]["by"]), esc(ui.day(p["cleared"]["at"])), esc(p["cleared"]["note"]))
+            elif p["kind"] == "mapping":
+                right = '<a href="/financials/%s/mapping">Confirm the heads</a>' % c["id"]
+            elif can:
+                right = post("clear", '<input type="hidden" name="pid" value="%s"><input class="in" name="note" aria-label="Why this point is acceptable" placeholder="Why this is acceptable" style="width:220px" required><button class="btn" type="submit">Clear</button>' % esc(p["id"]))
+            else:
+                right = '<span class="cap">For the reviewer</span>'
+            pts += '<div class="tr" style="grid-template-columns:84px 1fr"><span>%s</span><span>%s<div style="margin-top:6px">%s</div></span></div>' % (
+                badge(kinds[p["kind"]], "ok" if p["cleared"] else "wa"), esc(p["text"]), right)
         if not pts:
             pts = '<div class="empty">%s</div>' % ("No open points: every check in the workbook reads OK and every ledger head is approved." if wb else "Review points appear here after Get data.")
+        head = "%d open" % st["open"] if wb else ""
+        if st["stale"]:
+            out.append('<div class="note">Ledger heads were changed after this workbook was built. %s</div>' % (post("rebuild", '<button class="btn" type="submit">Rebuild now</button>') if can else "A reviewer rebuilds it."))
+        if st["verified"]:
+            v = st["verified"]
+            out.append('<div class="note ok" role="status" style="display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap"><span>%s Verified by %s on %s. These financials can go to ROC filing.</span>%s</div>'
+                       % (badge("Verified", "ok"), esc(v["by"]), esc(ui.day(v["at"], True)), post("unverify", '<button class="btn link" type="submit">Withdraw the tick</button>') if can else ""))
         out.append('<div class="g"><div class="card s6"><div class="ch"><h2>Data and workbook</h2></div>%s</div>'
                    '<div class="card s6"><div class="ch"><h2>Review points</h2><span class="cap">%s</span></div>%s</div></div>'
-                   % (data, "%d open" % len(st["points"]) if wb else "", pts))
+                   % (data, head, pts))
         checks = [r for r in (b.get("checks") or [])]
         rows, started = "", False
         for r in checks:
@@ -414,8 +505,11 @@ class App:
                         % (esc(ui.day(t["at"], True)), esc(t["text"]), esc(t.get("by", ""))) for t in tr) or '<div class="empty">Nothing recorded yet.</div>'
         out.append('<div class="card"><div class="ch"><h2>Audit trail</h2><span class="cap">Source, period and file for every step, kept in the client folder</span></div>%s</div>' % trail)
         running = job and job["state"] in ("queued", "running")
+        tick = bool(wb) and can and not st["open"] and not st["stale"] and not st["verified"] and not running
         act = ('<form method="post" action="/financials/get-data">%s<input type="hidden" name="client" value="%s"><input type="hidden" name="back" value="/financials/%s">'
-               '<button class="btn p" type="submit"%s>Get data</button></form>' % (hidden(ctx["csrf"]), c["id"], c["id"], " disabled" if why or running else ""))
+               '<button class="btn%s" type="submit"%s>Get data</button></form>' % (hidden(ctx["csrf"]), c["id"], c["id"], "" if tick else " p", " disabled" if why or running else ""))
+        if tick:
+            act += post("verify", '<button class="btn p" type="submit">Verified, OK to file</button>')
         return self.page(ctx, "financials", c["name"], "".join(out), sub='<a href="/financials">Financials</a> · FY %s' % esc(fy), actions=act)
 
     # ------------------------------------------------------------------ settings and people

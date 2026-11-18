@@ -73,7 +73,19 @@ class FakeApproval:
     @staticmethod
     def analyse(cy, py, cfg):
         done = cfg.get("approvals", {})
-        return [dict(ledger=r["ledger_name"], approved=r["ledger_name"] in done or r["group_name"] != "Indirect Expenses") for r in cy]
+        return [dict(ledger=r["ledger_name"], group=r["group_name"], cy=r["closing_balance"], py=0.0, reason="", warn="",
+                     proposed={"code": "OEXP1"}, approved=r["ledger_name"] in done or r["group_name"] != "Indirect Expenses") for r in cy]
+
+
+    @staticmethod
+    def head_options():
+        return [{"code": "OEXP1", "label": "Other expenses - Rent"}, {"code": "EMP1", "label": "Employee benefits expense - Salaries and wages"}]
+
+    @staticmethod
+    def apply_decisions(cfg, rows, decisions, user, fy):
+        for led, code in decisions.items():
+            cfg.setdefault("approvals", {})[led] = {"code": code, "by": user, "fy": fy}
+        return cfg
 
 
 class FakePipeline:
@@ -185,11 +197,11 @@ class Run(unittest.TestCase):
     def test_review_points(self):
         F.get_data(CLIENT, self.root, SETTINGS, engine=engine(ONE))
         pts = F.status(CLIENT, self.root, "2025-26")["points"]
-        self.assertEqual(pts, [("mapping", "2 ledgers mapped by the agent: a reviewer confirms the heads")])
+        self.assertEqual([(p["id"], p["text"]) for p in pts], [("mapping", "2 ledgers mapped by the agent: a reviewer confirms the heads")])
         eng = engine(ONE)
         eng.pipeline.status = "ERROR"
         F.build(CLIENT, self.root, SETTINGS, engine=eng)
-        self.assertIn(("check", "Balance Sheet tallies (Assets - Equity & Liabilities)"), F.status(CLIENT, self.root, "2025-26")["points"])
+        self.assertIn("Balance Sheet tallies (Assets - Equity & Liabilities)", [p["text"] for p in F.status(CLIENT, self.root, "2025-26")["points"]])
 
     def test_company_not_open_asks_staff_with_the_open_list(self):
         with self.assertRaises(F.StaffNeeded) as e:
@@ -228,6 +240,79 @@ class Run(unittest.TestCase):
             F.load_engine(self.tmp.name)
 
 
+class Review(unittest.TestCase):
+    FY = "2025-26"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = str(Path(self.tmp.name) / "Clients")
+        self.eng = engine(ONE)
+        self.eng.pipeline.status = "ERROR"
+        F.get_data(CLIENT, self.root, SETTINGS, engine=self.eng)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def st(self):
+        return F.status(CLIENT, self.root, self.FY)
+
+    def trail(self):
+        p = Path(self.root) / CLIENT["folder"] / "_os" / "trail.jsonl"
+        return [json.loads(l) for l in p.read_text(encoding="utf-8").splitlines()]
+
+    def test_tick_is_refused_while_points_are_open(self):
+        self.assertEqual(self.st()["open"], 2)
+        with self.assertRaises(ValueError):
+            F.verify(CLIENT, self.root, self.FY, "Rev Iewer")
+        self.assertIsNone(self.st()["verified"])
+
+    def test_clearing_needs_a_reason_and_is_recorded(self):
+        pid = "check:balance-sheet-tallies-assets-equity-liabilities"
+        with self.assertRaises(ValueError):
+            F.clear_point(CLIENT, self.root, self.FY, pid, "Rev Iewer", " ")
+        F.clear_point(CLIENT, self.root, self.FY, pid, "Rev Iewer", "Rounding difference of Rs 1")
+        pt = next(p for p in self.st()["points"] if p["id"] == pid)
+        self.assertEqual((pt["cleared"]["by"], pt["cleared"]["note"]), ("Rev Iewer", "Rounding difference of Rs 1"))
+        last = self.trail()[-1]
+        self.assertEqual((last["by"], last["point"]), ("Rev Iewer", pid))
+        self.assertIn("Rounding difference of Rs 1", last["text"])
+
+    def test_mapping_point_cannot_be_cleared_by_hand(self):
+        with self.assertRaises(ValueError):
+            F.clear_point(CLIENT, self.root, self.FY, "mapping", "Rev Iewer", "Looks fine to me")
+        with self.assertRaises(ValueError):
+            F.clear_point(CLIENT, self.root, self.FY, "nope", "Rev Iewer", "Looks fine to me")
+
+    def test_approve_heads_then_rebuild_then_tick(self):
+        n = F.approve_heads(CLIENT, self.root, self.FY, {"Salaries": "EMP1", "Rent": "OEXP1", "Ghost": "OEXP1", "Sales": "BAD"}, "Rev Iewer", self.eng)
+        self.assertEqual(n, 2)
+        t = [x for x in self.trail() if x.get("ledger")]
+        self.assertEqual({(x["ledger"], x["code"], x["override"], x["by"]) for x in t},
+                         {("Salaries", "EMP1", True, "Rev Iewer"), ("Rent", "OEXP1", False, "Rev Iewer")})
+        self.assertTrue(self.st()["stale"])
+        self.eng.pipeline.status = "OK"
+        with self.assertRaises(ValueError):
+            F.verify(CLIENT, self.root, self.FY, "Rev Iewer")
+        F.build(CLIENT, self.root, SETTINGS, engine=self.eng)
+        st = self.st()
+        self.assertEqual((st["stale"], st["open"], st["points"]), (False, 0, []))
+        F.verify(CLIENT, self.root, self.FY, "Rev Iewer")
+        self.assertEqual(self.st()["verified"]["by"], "Rev Iewer")
+        self.assertIn("Financials verified", self.trail()[-1]["text"])
+
+    def test_new_build_or_new_heads_withdraw_the_tick(self):
+        self.eng.pipeline.status = "OK"
+        F.approve_heads(CLIENT, self.root, self.FY, {"Salaries": "EMP1", "Rent": "OEXP1"}, "Rev Iewer", self.eng)
+        F.build(CLIENT, self.root, SETTINGS, engine=self.eng)
+        F.verify(CLIENT, self.root, self.FY, "Rev Iewer")
+        F.build(CLIENT, self.root, SETTINGS, engine=self.eng)
+        self.assertIsNone(self.st()["verified"])
+        F.verify(CLIENT, self.root, self.FY, "Rev Iewer")
+        F.unverify(CLIENT, self.root, self.FY, "Pat Partner")
+        self.assertIsNone(self.st()["verified"])
+        self.assertEqual(self.trail()[-1]["text"], "Verified tick withdrawn")
+
+
 class Screens(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -259,8 +344,48 @@ class Screens(unittest.TestCase):
 
     def use(self, open_cos):
         eng = engine(open_cos)
+        self.app.fin_engine = eng
         self.app.fin_jobs.runner = lambda c, root, s, **kw: F.get_data(c, root, s, engine=eng, **kw)
+        self.app.fin_jobs.builder = lambda c, root, s, **kw: F.build(c, root, s, engine=eng, **kw)
         return eng
+
+    def test_reviewer_confirms_heads_and_ticks(self):
+        self.use([{"name": n, "books_from": "2020-04-01"} for n in self.by])
+        cid = self.by["Sample Fasteners Pvt Ltd"]["id"]
+        self.post("/financials/get-data", _clients=[cid])
+        self.run_jobs()
+        _, _, html = self.get("/financials/" + cid)
+        self.assertIn("Confirm the heads", html)
+        self.assertNotIn("Verified, OK to file", html)
+        s, _, html = self.get("/financials/%s/mapping" % cid)
+        self.assertEqual(s, 200)
+        self.assertIn("2 ledgers to confirm", html)
+        self.assertEqual(html.count('class="btn p"'), 1)
+        s, h, _ = self.post("/financials/%s/mapping" % cid, n="2", led_0="Salaries", head_0="EMP1", led_1="Rent", head_1="OEXP1")
+        self.assertEqual((s, h["Location"]), (303, "/financials/" + cid))
+        self.run_jobs()
+        _, _, html = self.get("/financials/" + cid)
+        self.assertIn("Verified, OK to file", html)
+        self.assertEqual(html.count('class="btn p"'), 1)
+        self.post("/financials/%s/verify" % cid)
+        _, _, html = self.get("/financials/" + cid)
+        self.assertIn("Verified by Pat Partner", html)
+        _, _, html = self.get("/financials")
+        self.assertIn(">Verified<", html)
+
+    def test_staff_cannot_review(self):
+        self.use([{"name": n, "books_from": "2020-04-01"} for n in self.by])
+        cid = self.by["Sample Fasteners Pvt Ltd"]["id"]
+        self.post("/financials/get-data", _clients=[cid])
+        self.run_jobs()
+        self.app.users.add("Sam Staff", "sam", "staff", "password1")
+        _, h, _ = self.app.handle("POST", "/login", form=dict(login="sam", password="password1"))
+        self.tok = h["Set-Cookie"].split("=", 1)[1].split(";")[0]
+        self.csrf = self.app.sessions.get(self.tok)["csrf"]
+        self.assertEqual(self.post("/financials/%s/verify" % cid)[0], 403)
+        self.assertEqual(self.post("/financials/%s/mapping" % cid, n="1", led_0="Rent", head_0="OEXP1")[0], 403)
+        self.assertEqual(self.post("/financials/%s/clear" % cid, pid="mapping", note="fine by me")[0], 403)
+        self.assertIsNone(F.status(self.by["Sample Fasteners Pvt Ltd"], str(self.root), "2025-26")["verified"])
 
     def run_jobs(self):
         t = self.app.fin_jobs.thread
@@ -285,7 +410,7 @@ class Screens(unittest.TestCase):
             self.assertEqual(self.app.fin_jobs.get(i)["state"], "review")
         self.assertEqual(len(list(self.root.glob("*/* - Schedule III FY2025-26.xlsx"))), 3)
         _, _, html = self.get("/financials")
-        self.assertEqual(html.count("Review points"), 3)
+        self.assertEqual(html.count("1 review points"), 3)
 
     def test_pick_list_then_run_with_the_pick(self):
         self.use([{"name": "SF Books", "books_from": "2020-04-01"}])
@@ -341,6 +466,12 @@ class RealEngine(unittest.TestCase):
             names = [r[0] for r in st["checks"]]
             self.assertIn("Balance Sheet tallies (Assets - Equity & Liabilities)", names)
             self.assertEqual(st["ledgers"], len(CY))
+            eng = F.Engine(fake, real.approval, real.pipeline)
+            pend = [r for r in F.mapping_rows(CLIENT, tmp, "2025-26", eng) if not r["approved"]]
+            self.assertEqual({r["ledger"] for r in pend}, set(st["unapproved"]))
+            n = F.approve_heads(CLIENT, tmp, "2025-26", {r["ledger"]: r["proposed"]["code"] for r in pend}, "Rev Iewer", eng)
+            self.assertEqual(n, len(pend))
+            self.assertEqual(F.build(CLIENT, tmp, SETTINGS, engine=eng)["unapproved"], [])
 
 
 if __name__ == "__main__":
