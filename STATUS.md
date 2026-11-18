@@ -25,7 +25,7 @@ Last updated: 18 Nov 2026, by the orchestrator session.
   board report, auditor report, minutes) through the engine's `make_docs_std.py`.
 - Hand-off to Form Filler: approved workbook plus answers out, status and SRN back.
 - Proposals link (1a) once the gaps in `docs/proposal-link.md` are answered.
-- Apply the high-fidelity design once the owner signs it off.
+- Apply the high-fidelity design (signed off by the owner on 18 Nov 2026, for now).
 
 ## Not verified
 - Get data against a live Tally. The cloud session cannot reach Tally; tests use a stand-in for Tally and the real

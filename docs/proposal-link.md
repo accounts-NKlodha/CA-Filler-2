@@ -50,8 +50,8 @@ Status shown in the Proposals list: draft, ready, sent, awaiting firm signature,
 
 ## Gaps (also listed in STATUS.md)
 
-1. Reader account. The OS needs one partner sign-in in Proposal Maker's allowlist to read with. Owner decides whether
-   that is an existing partner or a dedicated reader.
+1. Reader account. Decided by the owner on 18 Nov 2026: the OS reads with an existing partner sign-in (two are
+   named; the addresses are kept in Settings, not here). The password is entered in Settings by that partner.
 2. CIN or LLPIN is not held in Proposal Maker. Staff enter it when confirming the set-up.
 3. A proposal's services are not tied to an entity. When a group has several entities, staff choose which entity gets
    which service at confirmation.
@@ -60,4 +60,5 @@ Status shown in the Proposals list: draft, ready, sent, awaiting firm signature,
    are to be agreed per service line as each is built.
 6. `lodha_os/services.py` holds the 16 service names from `src/data/services.ts`. It should also hold each service's
    `code`, so a renamed service still maps. To be checked against the live `services` table.
-7. Whether Proposal Maker holds real proposals yet is not known (letterheads were pending).
+7. Proposal Maker is not in full use yet (owner, 18 Nov 2026), so the link is built and tested against made-up
+   proposals first, and clients are still added by hand in the OS.
