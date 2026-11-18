@@ -23,3 +23,17 @@ Back up `data/` with the client folders.
 ## Tests
 
 `python -m unittest`
+
+## Financials
+
+Financials > tick clients > Get data. The OS reads this year's and last year's trial balance from Tally (the client
+companies must be open in Tally) and builds the Schedule III workbook into each client folder.
+
+Set these once in Settings:
+
+- Client folders location.
+- Form Filler folder: a checkout of the Form-Filler repo. Its `sch3/engine` is used as it is, so run its
+  `sch3/setup.bat` once (openpyxl, pycel, pypdf).
+- Tally host and port (default localhost, 9000).
+
+Read contract for the Proposal Maker link: `docs/proposal-link.md`.

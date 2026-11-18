@@ -7,14 +7,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
 
-from . import auth, clients, config, services, ui
+from . import auth, clients, config, financials, services, ui
 from .ui import badge, esc, field, hidden, select
 
 COOKIE = "lodha_os"
 # What each menu item will hold, in CLAUDE.md's order of work. Shown until the screen is built: no fake screens.
 PLANNED = {
     "proposals": ("1a", "Proposals from Proposal Maker with their status. An executed proposal sets up the client here."),
-    "financials": ("2", "Get data from Tally and build the Schedule III pack, with review points for the reviewer."),
     "roc": ("2", "Hands approved financials to Form Filler for AOC-4 and MGT-7 or MGT-7A, and shows the SRN it returns."),
     "gst": ("3", "GSTR-9 and GSTR-9C: reconciliation and the JSON file for upload on the GST portal."),
     "tds": ("4", "Monthly TDS computation, then the quarterly return file."),
@@ -33,6 +32,7 @@ class App:
         self.users = auth.Users(self.st)
         self.clients = clients.Clients(self.st)
         self.sessions = auth.Sessions()
+        self.fin_jobs = financials.Jobs(self.st)
 
     # ------------------------------------------------------------------ plumbing
     def handle(self, method, path, query=None, form=None, cookie=""):
@@ -65,6 +65,8 @@ class App:
             return self.clients_route(method, rest, query, form, ctx)
         if head == "settings":
             return self.settings_route(method, rest, form, ctx)
+        if head == "financials":
+            return self.financials_route(method, rest, form, ctx)
         if head in PLANNED and not rest:
             return ok(self.planned(head, ctx))
         return 404, {}, self.page(ctx, "", "Page not found", '<p>There is nothing at this address. <a href="/">Go to Home</a>.</p>')
@@ -245,6 +247,8 @@ class App:
         out = ['<div class="note ok" role="status">Saved.</div>' if query.get("saved") else "", '<nav class="tabs" aria-label="Client sections">%s</nav>' % tabs]
         if tab:
             key = tab.lower().replace(" ", "-")
+            if tab == "Financials":
+                return redirect("/financials/" + c["id"])
             step, text = PLANNED.get(key, ("", "Work for this service is tracked outside the OS for now."))
             mine = [s for s in c["services"] if services.SERVICES[s] == tab]
             out.append('<div class="card"><div class="ch"><h2>%s</h2>%s</div><div class="cb"><p style="margin:0 0 8px">Services engaged: %s.</p>'
@@ -266,6 +270,153 @@ class App:
             out.append('<div class="g"><div class="card s6"><div class="ch"><h2>Details</h2></div>%s</div>'
                        '<div class="card s6"><div class="ch"><h2>Audit trail</h2><span class="cap">Kept in the client folder</span></div>%s</div></div>' % (details, trail))
         return self.page(ctx, "clients", c["name"], "".join(out), sub=sub, actions='<a class="btn" href="/clients/%s/edit">Edit client</a>' % c["id"])
+
+    # ------------------------------------------------------------------ financials
+    FIN_LINES = ("Financials", "ROC")
+    JOB = {"queued": ("Queued", ""), "running": ("Agent working", "in"), "staff": ("Waiting for staff", "wa"),
+           "review": ("Review points", "wa"), "done": ("Ready", "ok"), "failed": ("Failed", "no")}
+
+    def fin_clients(self):
+        return [c for c in self.clients.all() if set(services.lines_of(c.get("services"))) & set(self.FIN_LINES)]
+
+    def fin_ready(self):
+        """Why Get data cannot run yet, or ''."""
+        if not self.root():
+            return "The client folders location is not set."
+        if not os.path.isfile(str(financials.engine_dir(self.s["form_filler_dir"]) / "pipeline.py")):
+            return "The Form Filler folder is not set, so the shared Schedule III engine cannot be found."
+        return ""
+
+    def financials_route(self, method, rest, form, ctx):
+        user = ctx["user"]
+        if method == "POST" and rest == ["get-data"]:
+            ids = set(form.get("_clients") or [])
+            rows = [c for c in self.fin_clients() if c["id"] in ids]
+            if rows and not self.fin_ready():
+                picks = {}
+                if form.get("pick_which") in ("tb_cy", "tb_py") and form.get("pick_company") and len(rows) == 1:
+                    picks[rows[0]["id"]] = {form["pick_which"]: form["pick_company"]}
+                self.fin_jobs.start(rows, self.root(), self.s, user["name"], picks)
+            return redirect(form.get("back") if str(form.get("back", "")).startswith("/financials") else "/financials")
+        if not rest:
+            return ok(self.fin_list(ctx))
+        c = self.clients.get(rest[0])
+        if not c or c not in self.fin_clients():
+            return 404, {}, self.page(ctx, "financials", "Client not found", '<p><a href="/financials">Back to Financials</a></p>')
+        if rest[1:] == ["workbook"]:
+            wb = financials.status(c, self.root(), ctx["fy"])["workbook"]
+            if not wb:
+                return redirect("/financials/" + c["id"])
+            clients.trail(self.root(), c, "financials", "Schedule III workbook downloaded: %s" % wb.name, user["name"])
+            return 200, {"Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                         "Content-Disposition": 'attachment; filename="%s"' % wb.name.replace('"', "")}, wb.read_bytes()
+        return ok(self.fin_view(c, ctx))
+
+    def fin_list(self, ctx):
+        rows, why, root, fy = self.fin_clients(), self.fin_ready(), self.root(), ctx["fy"]
+        out = []
+        if why:
+            out.append('<div class="note">%s %s</div>' % (esc(why), '<a href="/settings">Open Settings</a>' if auth.can(ctx["user"], "change_settings") else "A partner sets this in Settings."))
+        if not rows:
+            out.append('<div class="card"><div class="empty">No client has Accounting, Statutory audit or MCA annual compliance switched on yet. '
+                       'Switch the service on in the client to see it here.</div></div>')
+            return self.page(ctx, "financials", "Financials", "".join(out), sub="Professional Services")
+        cols = "grid-template-columns:32px 1.6fr 1.2fr 1.2fr 1fr 1.6fr"
+        busy = self.fin_jobs.busy()
+        body = ('<form method="post" action="/financials/get-data" id="gd">%s<div class="card"><div class="ch"><h2>Schedule III, FY %s</h2>'
+                '<span class="cap">Open the client companies in Tally, tick the clients, then Get data</span></div>'
+                '<div class="tr th" style="%s"><span></span><span>Client</span><span>This year from Tally</span><span>Last year from Tally</span>'
+                '<span>Schedule III</span><span>Where it stands</span></div>' % (hidden(ctx["csrf"]), esc(fy), cols))
+        for c in rows:
+            st = financials.status(c, root, fy)
+            job = self.fin_jobs.get(c["id"])
+            if job and job.get("fy", fy) != fy:
+                job = None
+            tb = lambda t: ('%s<br><span class="cap">%s</span>' % (esc(t["company"]), esc(ui.day(t["at"], True)))) if t else '<span class="mut">Not read</span>'
+            if job:
+                lab, kind = self.JOB[job["state"]]
+                where = "%s <span class=\"cap\">%s</span>" % (badge(lab, kind), esc(job.get("note", "")))
+            elif st["workbook"]:
+                n = len(st["points"])
+                where = badge("%d review points" % n, "wa") if n else badge("Ready", "ok")
+            else:
+                where = '<span class="mut">Not started</span>'
+            wb = '<a href="/financials/%s">Open</a>' % c["id"] if st["workbook"] else '<span class="mut">Not built</span>'
+            body += ('<div class="tr" style="%s"><span><input type="checkbox" name="client" value="%s" aria-label="Select %s"></span>'
+                     '<span><a href="/financials/%s" style="font-weight:500">%s</a>%s</span><span>%s</span><span>%s</span><span>%s</span><span>%s</span></div>'
+                     % (cols, c["id"], esc(c["name"]), c["id"], esc(c["name"]),
+                        '<br><span class="cap">%s</span>' % esc(c["group"]) if c.get("group") else "", tb(st["tb_cy"]), tb(st["tb_py"]), wb, where))
+        body += '</div></form>'
+        body += ('<p class="cap" style="margin:0">Get data reads this year and last year from Tally, maps every ledger to its Schedule III head and builds the workbook, '
+                 'one client after another. A reviewer clears the review points. Nothing is filed from here.</p>')
+        if busy:
+            body += '<script>setTimeout(function(){location.reload()},4000)</script>'
+        act = '<button class="btn p" type="submit" form="gd"%s>Get data</button>' % (" disabled" if why else "")
+        return self.page(ctx, "financials", "Financials", "".join(out) + body, sub="Professional Services", actions=act)
+
+    def fin_view(self, c, ctx):
+        root, fy = self.root(), ctx["fy"]
+        st = financials.status(c, root, fy)
+        job = self.fin_jobs.get(c["id"])
+        if job and job.get("fy", fy) != fy:
+            job = None
+        why = self.fin_ready()
+        out = []
+        if why:
+            out.append('<div class="note">%s</div>' % esc(why))
+        if job and job["state"] in ("queued", "running"):
+            out.append('<div class="note" role="status">%s %s</div><script>setTimeout(function(){location.reload()},4000)</script>'
+                       % (badge("Agent working", "in"), esc(job.get("note", ""))))
+        elif job and job["state"] == "failed":
+            out.append('<div class="note" role="alert">%s %s</div>' % (badge("Failed", "no"), esc(job.get("note", ""))))
+        elif job and job["state"] == "staff":
+            pick = job.get("pick")
+            form = ""
+            if pick:
+                form = ('<form method="post" action="/financials/get-data" style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;margin-top:12px">%s'
+                        '<input type="hidden" name="client" value="%s"><input type="hidden" name="pick_which" value="%s">'
+                        '<input type="hidden" name="back" value="/financials/%s">%s<button class="btn" type="submit">Use this company</button></form>'
+                        % (hidden(ctx["csrf"]), c["id"], esc(pick["which"]), c["id"],
+                           select("Companies open in Tally now", "pick_company", [(n, n) for n in pick["open"]])))
+            out.append('<div class="note" role="alert">%s %s%s</div>' % (badge("Waiting for staff", "wa"), esc(job.get("note", "")), form))
+        kv = lambda k, v: '<div class="kv"><span class="mut">%s</span><span>%s</span></div>' % (k, v)
+        tb = lambda t: ('%s <span class="cap">read %s</span>' % (esc(t["company"]), esc(ui.day(t["at"], True)))) if t else '<span class="mut">Not read yet</span>'
+        b = st["build"] or {}
+        wb = st["workbook"]
+        data = (kv("This year, %s" % esc(fy), tb(st["tb_cy"])) + kv("Last year, %s" % esc(financials.prev_fy(fy)), tb(st["tb_py"])) +
+                kv("Ledgers", str(b["ledgers"]) if b.get("ledgers") else '<span class="mut">None yet</span>') +
+                kv("Workbook", ('<a href="/financials/%s/workbook">%s</a> <span class="cap">built %s</span>' % (c["id"], esc(wb.name), esc(ui.day(b.get("finished", ""), True))))
+                   if wb else '<span class="mut">Not built yet</span>') +
+                kv("Kept in", '<span class="mono">%s</span>' % esc(str(clients.folder_path(root, c))) if root else '<span class="mut">Not set</span>'))
+        kinds = {"check": "Check", "mapping": "Mapping", "data": "Data"}
+        pts = "".join('<div class="tr" style="grid-template-columns:96px 1fr"><span>%s</span><span>%s</span></div>' % (badge(kinds[k], "wa"), esc(t)) for k, t in st["points"])
+        if not pts:
+            pts = '<div class="empty">%s</div>' % ("No open points: every check in the workbook reads OK and every ledger head is approved." if wb else "Review points appear here after Get data.")
+        out.append('<div class="g"><div class="card s6"><div class="ch"><h2>Data and workbook</h2></div>%s</div>'
+                   '<div class="card s6"><div class="ch"><h2>Review points</h2><span class="cap">%s</span></div>%s</div></div>'
+                   % (data, "%d open" % len(st["points"]) if wb else "", pts))
+        checks = [r for r in (b.get("checks") or [])]
+        rows, started = "", False
+        for r in checks:
+            if r[0].startswith("Tolerance"):
+                break
+            if r[0] == "Check":
+                started = True
+                continue
+            if started and len(r) > 3:
+                rows += ('<div class="tr" style="grid-template-columns:2.4fr 1fr 1fr 90px"><span>%s</span><span class="num">%s</span><span class="num">%s</span><span>%s</span></div>'
+                         % (esc(r[0]), esc(r[1]), esc(r[2]), badge(r[3], "ok" if r[3].strip().upper() == "OK" else "wa")))
+        if rows:
+            out.append('<div class="card"><div class="ch"><h2>Checks in the workbook</h2><span class="cap">Read from the Checks sheet, in rupees</span></div>'
+                       '<div class="tr th" style="grid-template-columns:2.4fr 1fr 1fr 90px"><span>Check</span><span class="num">This year</span><span class="num">Last year</span><span>Status</span></div>%s</div>' % rows)
+        tr = [t for t in (clients.read_trail(root, c, 200) if root else []) if t.get("kind") == "financials"][:15]
+        trail = "".join('<div class="tr" style="grid-template-columns:150px 1fr 120px"><span class="mono mut">%s</span><span>%s</span><span class="mut">%s</span></div>'
+                        % (esc(ui.day(t["at"], True)), esc(t["text"]), esc(t.get("by", ""))) for t in tr) or '<div class="empty">Nothing recorded yet.</div>'
+        out.append('<div class="card"><div class="ch"><h2>Audit trail</h2><span class="cap">Source, period and file for every step, kept in the client folder</span></div>%s</div>' % trail)
+        running = job and job["state"] in ("queued", "running")
+        act = ('<form method="post" action="/financials/get-data">%s<input type="hidden" name="client" value="%s"><input type="hidden" name="back" value="/financials/%s">'
+               '<button class="btn p" type="submit"%s>Get data</button></form>' % (hidden(ctx["csrf"]), c["id"], c["id"], " disabled" if why or running else ""))
+        return self.page(ctx, "financials", c["name"], "".join(out), sub='<a href="/financials">Financials</a> · FY %s' % esc(fy), actions=act)
 
     # ------------------------------------------------------------------ settings and people
     def settings_route(self, method, rest, form, ctx):
@@ -365,6 +516,7 @@ class Handler(BaseHTTPRequestHandler):
             raw = parse_qs(self.rfile.read(n).decode("utf-8", "replace"), keep_blank_values=True)
             form = {k: v[-1] for k, v in raw.items()}
             form["_services"] = raw.get("services", [])
+            form["_clients"] = raw.get("client", [])
         ck = SimpleCookie(self.headers.get("Cookie") or "")
         tok = ck[COOKIE].value if COOKIE in ck else ""
         try:
@@ -373,9 +525,10 @@ class Handler(BaseHTTPRequestHandler):
             import traceback
             traceback.print_exc()
             status, headers, body = 500, {}, ui.bare("Something went wrong", '<p>The OS hit an error on this page. It has been written to the server window. <a href="/">Go to Home</a>.</p>')
-        data = body.encode("utf-8")
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
         self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        if "Content-Type" not in headers:
+            self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Frame-Options", "DENY")

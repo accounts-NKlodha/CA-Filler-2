@@ -133,7 +133,7 @@ class Flow(unittest.TestCase):
 
     def test_unbuilt_screens_say_so(self):
         self.start()
-        for p in ("/proposals", "/financials", "/gst", "/tds", "/agents", "/inbox", "/billing"):
+        for p in ("/proposals", "/gst", "/tds", "/agents", "/inbox", "/billing"):
             s, _, html = self.get(p)
             self.assertEqual(s, 200)
             self.assertIn("Not built yet", html)
